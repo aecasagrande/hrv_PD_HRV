@@ -21,6 +21,12 @@ Version 2.5 (4 Oct 2026) — refactor of GPR_Improved.py.
          [D25]; a hole in the ECG recording inside a trial is excluded
          instead of bridged [D26]; a trial can be read from another ECG lead
          (P-015 OFF 5-min sitting from ECG 2, as its run sheet says) [D27].
+    2.6.1  robustness fixes from a code review (see CHANGELOG.md): EDF files at a
+         different sampling rate are resampled, overlapping EDF files are no
+         longer interleaved, sync-log times past midnight, duplicate trial names,
+         spectral metrics that cannot be computed are empty instead of 0, the
+         Lomb–Scargle detrend is fitted against time, and spectra use clock
+         times so a recording hole keeps its duration.
 
 HOW TO RUN
     BATCH_MODE = True   every participant/state in PARTICIPANTS → one workbook each
@@ -734,7 +740,7 @@ from sklearn.gaussian_process.kernels import ConstantKernel, RBF, RationalQuadra
 
 _trapz = getattr(np, 'trapezoid', getattr(np, 'trapz', None))
 
-PIPELINE_VERSION = '2.6 (2026-10-05)'
+PIPELINE_VERSION = '2.6.1 (2026-10-05)'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -1117,6 +1123,13 @@ def parse_log_file_new(filepath, base_date):
                 return pd.NaT
 
         df['dt'] = df[ts_col].apply(combine_date_time)
+        # Only the time of day is taken from the log (the date comes from the EDF), so a
+        # session that runs past midnight would put its later trials ~24 h before the
+        # recording, and a trial spanning midnight would stop before it starts. Times
+        # more than 12 h before the recording start belong to the next day.
+        base = pd.Timestamp(base_date).replace(tzinfo=None)
+        df['dt'] = [t + pd.Timedelta(days=1) if pd.notna(t) and t < base - pd.Timedelta(hours=12) else t
+                    for t in df['dt']]
         trials, current_start, current_name = [], None, None
         for _, row in df.iterrows():
             event = str(row[event_col]).strip().lower()
@@ -1125,8 +1138,21 @@ def parse_log_file_new(filepath, base_date):
                 current_start, current_name = row['dt'], name
             elif event == 'stop' and current_name == name:
                 if pd.notna(current_start) and pd.notna(row['dt']):
-                    trials.append({'name': name, 'start': current_start, 'stop': row['dt']})
+                    stop = row['dt']
+                    if stop < current_start:  # the trial spans midnight
+                        stop += pd.Timedelta(days=1)
+                    trials.append({'name': name, 'start': current_start, 'stop': stop})
                 current_start = current_name = None
+        # Two trials with the same name used to overwrite each other in the workbook
+        # (the dict of processed trials is keyed by name): the later ones get a suffix.
+        seen = {}
+        for t in trials:
+            seen[t['name']] = seen.get(t['name'], 0) + 1
+            if seen[t['name']] > 1:
+                new = f"{t['name']}_dup{seen[t['name']]}"
+                print(f"⚠️  Trial '{t['name']}' appears more than once in the sync log; "
+                      f"occurrence {seen[t['name']]} is reported as '{new}'.")
+                t['name'] = new
         return trials
     except Exception as e:
         print(f"Error parsing log file: {e}")
@@ -2287,14 +2313,40 @@ def get_peak_frequency(f, psd, low, high):
     return float(f[mask][np.argmax(psd[mask])]) if np.any(mask) else 0.0
 
 
+_NAN = float('nan')
+# Spectral metrics that cannot be computed are NaN (an empty cell), not 0, which reads
+# as a real power / ratio of zero — the same rule as [D17] for the time domain.
+_FREQ_KEYS = ('VLF', 'LF', 'HF', 'Total_Power', 'LF/HF', 'LF_nu', 'HF_nu', 'VLF_rel', 'LF_rel', 'HF_rel')
+
+
+def _empty_freq(method, quality, **extra):
+    return {**{k: _NAN for k in _FREQ_KEYS}, 'method': method, 'quality': quality, **extra}
+
+
+def _ratio(a, b, scale=1.0):
+    return a / b * scale if b > 0 else _NAN
+
+
+def _detrend_on_time(t, y):
+    """Remove a straight line fitted against TIME. scipy's detrend() fits against
+    the sample index, which for an unevenly sampled RR series (excluded beats,
+    gaps) is not proportional to time."""
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if len(y) < 3 or np.ptp(t) <= 0:
+        return y - np.mean(y)
+    return y - np.polyval(np.polyfit(t - t[0], y, 1), t - t[0])
+
+
 def calculate_lomb_scargle_psd(rr_times_sec, rr_ms):
-    _empty = {'LF': 0, 'HF': 0, 'LF/HF': 0, 'Total_Power': 0, 'VLF': 0, 'method': 'lomb-scargle'}
+    rr_times_sec = np.asarray(rr_times_sec, dtype=float)
+    rr_ms = np.asarray(rr_ms, dtype=float)
     if len(rr_ms) < 10:
-        return {**_empty, 'quality': 'insufficient_data'}
+        return _empty_freq('lomb-scargle', 'insufficient_data')
     duration = rr_times_sec[-1] - rr_times_sec[0]
     if duration < MIN_SEGMENT_DURATION:
-        return {**_empty, 'quality': 'insufficient_duration', 'duration_sec': duration}
-    rr_detrended = detrend(rr_ms, type='linear')
+        return _empty_freq('lomb-scargle', 'insufficient_duration', duration_sec=duration)
+    rr_detrended = _detrend_on_time(rr_times_sec, rr_ms)
     frequencies = np.linspace(0.0001, 0.5, 4096)
     pgram = lombscargle(rr_times_sec, rr_detrended, 2 * np.pi * frequencies, normalize=False)
     area = float(_trapz(pgram, frequencies))
@@ -2312,12 +2364,9 @@ def calculate_lomb_scargle_psd(rr_times_sec, rr_ms):
         'VLF_peak': get_peak_frequency(frequencies, psd, 0.003, 0.04),
         'LF_peak': get_peak_frequency(frequencies, psd, 0.04, 0.15),
         'HF_peak': get_peak_frequency(frequencies, psd, 0.15, 0.40),
-        'LF/HF': lf / hf if hf > 0 else 0,
-        'LF_nu': lf / lhfs * 100 if lhfs > 0 else 0,
-        'HF_nu': hf / lhfs * 100 if lhfs > 0 else 0,
-        'VLF_rel': vlf / tot * 100 if tot > 0 else 0,
-        'LF_rel': lf / tot * 100 if tot > 0 else 0,
-        'HF_rel': hf / tot * 100 if tot > 0 else 0,
+        'LF/HF': _ratio(lf, hf),
+        'LF_nu': _ratio(lf, lhfs, 100), 'HF_nu': _ratio(hf, lhfs, 100),
+        'VLF_rel': _ratio(vlf, tot, 100), 'LF_rel': _ratio(lf, tot, 100), 'HF_rel': _ratio(hf, tot, 100),
         'method': 'lomb-scargle', 'quality': 'good',
         'duration_sec': duration, 'n_intervals': len(rr_ms),
         'frequencies': frequencies, 'psd': psd,
@@ -2325,20 +2374,20 @@ def calculate_lomb_scargle_psd(rr_times_sec, rr_ms):
 
 
 def calculate_welch_psd(rr_ms, rr_times_sec=None):
-    _empty = {'LF': 0, 'HF': 0, 'LF/HF': 0, 'Total_Power': 0, 'VLF': 0, 'method': 'welch'}
+    rr_ms = np.asarray(rr_ms, dtype=float)
     if len(rr_ms) < 30:
-        return {**_empty, 'quality': 'insufficient_data'}
+        return _empty_freq('welch', 'insufficient_data')
     if rr_times_sec is not None and len(rr_times_sec) == len(rr_ms):
         rr_times = np.asarray(rr_times_sec, dtype=float) - np.asarray(rr_times_sec, dtype=float)[0]
     else:
         rr_times = np.cumsum(rr_ms) / 1000
         rr_times -= rr_times[0]
     if rr_times[-1] < MIN_SEGMENT_DURATION:
-        return {**_empty, 'quality': 'insufficient_duration'}
+        return _empty_freq('welch', 'insufficient_duration')
     fs_interp = 4.0
     time_grid = np.arange(0, rr_times[-1], 1 / fs_interp)
     if len(time_grid) < 10:
-        return {**_empty, 'quality': 'insufficient_data'}
+        return _empty_freq('welch', 'insufficient_data')
     rr_interp = interp1d(rr_times, rr_ms, kind='cubic', fill_value="extrapolate")(time_grid)
     rr_det = detrend(rr_interp, type='linear')
     nperseg = 256
@@ -2358,12 +2407,9 @@ def calculate_welch_psd(rr_ms, rr_times_sec=None):
         'VLF_peak': get_peak_frequency(f, Pxx, 0.003, 0.04),
         'LF_peak': get_peak_frequency(f, Pxx, 0.04, 0.15),
         'HF_peak': get_peak_frequency(f, Pxx, 0.15, 0.40),
-        'LF/HF': lf / hf if hf > 0 else 0,
-        'LF_nu': lf / lhfs * 100 if lhfs > 0 else 0,
-        'HF_nu': hf / lhfs * 100 if lhfs > 0 else 0,
-        'VLF_rel': vlf / tot * 100 if tot > 0 else 0,
-        'LF_rel': lf / tot * 100 if tot > 0 else 0,
-        'HF_rel': hf / tot * 100 if tot > 0 else 0,
+        'LF/HF': _ratio(lf, hf),
+        'LF_nu': _ratio(lf, lhfs, 100), 'HF_nu': _ratio(hf, lhfs, 100),
+        'VLF_rel': _ratio(vlf, tot, 100), 'LF_rel': _ratio(lf, tot, 100), 'HF_rel': _ratio(hf, tot, 100),
         'method': 'welch', 'quality': 'good',
         'frequencies': f, 'psd': Pxx,
     }
@@ -2463,7 +2509,7 @@ def compare_to_benchmark(custom_time, custom_freq, kubios):
         'SDNN': _agreement(custom_time['SDNN'], kt['SDNN'], BENCHMARK_TOLERANCES['SDNN']),
         'RMSSD': _agreement(custom_time['RMSSD'], kt['RMSSD'], BENCHMARK_TOLERANCES['RMSSD']),
         'pNN50': _agreement(custom_time['pNN50'], kt['pNN50'], BENCHMARK_TOLERANCES['pNN50']),
-        'LF/HF': _agreement(custom_freq.get('LF/HF', 0), kf.get('LF/HF', 0),
+        'LF/HF': _agreement(custom_freq.get('LF/HF', _NAN), kf.get('LF/HF', _NAN),
                             BENCHMARK_TOLERANCES['LF/HF']),
     }
     verdicts = [r['verdict'] for r in rows.values() if r['verdict'] != 'n/a']
@@ -2483,7 +2529,22 @@ def compare_to_benchmark(custom_time, custom_freq, kubios):
 # ─────────────────────────────────────────────────────────────────────────────
 # HRV METRICS (continued)
 # ─────────────────────────────────────────────────────────────────────────────
-def calculate_hrv_metrics(peak_indices, fs, correction):
+def _position_seconds(positions, fs, sample_index=None):
+    """Seconds of (possibly fractional) sample positions, relative to the first.
+    With the segment's own time stamps (`sample_index`) a hole in the recording
+    [D26] keeps its real duration; from sample numbers alone the samples on either
+    side of the hole are adjacent, so the hole would be spliced shut in time."""
+    positions = np.asarray(positions, dtype=float)
+    if not len(positions):
+        return positions
+    if sample_index is None:
+        return (positions - positions[0]) / fs
+    ns = pd.DatetimeIndex(sample_index).asi8
+    rel = np.interp(positions, np.arange(len(ns)), (ns - ns[0]).astype(float)) / 1e9
+    return rel - rel[0]
+
+
+def calculate_hrv_metrics(peak_indices, fs, correction, sample_index=None):
     """All HRV metrics for one trial from ONE correction result [D5] — the
     exported corrected RR series and these metrics can no longer come from two
     different reconstructions.
@@ -2494,18 +2555,21 @@ def calculate_hrv_metrics(peak_indices, fs, correction):
       corrected  the reconstruction with unrecoverable gaps dropped; time stamps
                  are the RECONSTRUCTED R-peak times [D6], so a dropped gap stays
                  a gap in time instead of being spliced shut by a cumulative sum.
+    `sample_index` (the time stamps of the samples peak_indices refer to): beat
+    times for the spectra are then clock times, so a hole in the recording keeps
+    its duration. None ⇒ sample number / fs (previous behaviour).
     Returns the metrics dict (None if < 5 peaks)."""
     peak_indices = np.asarray(peak_indices)
     if len(peak_indices) < 5:
         return None
     rr_ms = np.diff(peak_indices) / fs * 1000
-    rr_times_sec = peak_indices[1:] / fs - peak_indices[1] / fs
+    rr_times_sec = _position_seconds(peak_indices[1:], fs, sample_index)
 
     gap_mask = np.asarray(correction['gap_mask'], dtype=bool)
     keep = ~gap_mask
     recon = np.asarray(correction['reconstructed'], dtype=float)
     corrected_rr_ms = np.asarray(correction['corrected_rr'], dtype=float)[keep] / fs * 1000
-    corrected_rr_times = recon[1:][keep] / fs - recon[1] / fs
+    corrected_rr_times = _position_seconds(recon[1:], fs, sample_index)[keep]
     n_unrecoverable = int(np.sum(gap_mask))
 
     bad_interval = np.asarray(correction['bad'], dtype=bool)
@@ -2518,7 +2582,7 @@ def calculate_hrv_metrics(peak_indices, fs, correction):
     freq_lomb_clean = (
         calculate_lomb_scargle_psd(clean_rr_times, clean_rr_ms)
         if len(clean_rr_ms) >= 10
-        else {'LF': 0, 'HF': 0, 'LF/HF': 0, 'quality': 'too_many_exclusions', 'method': 'lomb-scargle'}
+        else _empty_freq('lomb-scargle', 'too_many_exclusions')
     )
     if len(clean_rr_ms) >= 10:
         freq_lomb_clean.update(excluded_beats=excl_count, exclusion_rate=excl_rate)
@@ -2526,7 +2590,7 @@ def calculate_hrv_metrics(peak_indices, fs, correction):
     freq_welch_clean = (
         calculate_welch_psd(clean_rr_ms, rr_times_sec=clean_rr_times)
         if len(clean_rr_ms) >= 30
-        else {'LF': 0, 'HF': 0, 'LF/HF': 0, 'quality': 'too_many_exclusions', 'method': 'welch'}
+        else _empty_freq('welch', 'too_many_exclusions')
     )
     if len(clean_rr_ms) >= 30:
         freq_welch_clean.update(excluded_beats=excl_count, exclusion_rate=excl_rate)
@@ -2642,26 +2706,26 @@ def export_hrv_to_excel(processed_data, output_path, run_info=None):
         wc, lc = metrics['freq_welch_clean'], metrics['freq_welch_corrected']
         freq_welch_data.append({
             'Trial': trial_name,
-            'VLF_Clean': wc.get('VLF', 0), 'LF_Clean': wc.get('LF', 0),
-            'HF_Clean': wc.get('HF', 0), 'Total_Power_Clean': wc.get('Total_Power', 0),
-            'LF_HF_Ratio_Clean': wc.get('LF/HF', 0),
-            'LF_nu_Clean': wc.get('LF_nu', 0), 'HF_nu_Clean': wc.get('HF_nu', 0),
+            'VLF_Clean': wc.get('VLF', _NAN), 'LF_Clean': wc.get('LF', _NAN),
+            'HF_Clean': wc.get('HF', _NAN), 'Total_Power_Clean': wc.get('Total_Power', _NAN),
+            'LF_HF_Ratio_Clean': wc.get('LF/HF', _NAN),
+            'LF_nu_Clean': wc.get('LF_nu', _NAN), 'HF_nu_Clean': wc.get('HF_nu', _NAN),
             'Quality_Clean': wc.get('quality', 'unknown'),
-            'VLF_Corrected': lc.get('VLF', 0), 'LF_Corrected': lc.get('LF', 0),
-            'HF_Corrected': lc.get('HF', 0), 'Total_Power_Corrected': lc.get('Total_Power', 0),
-            'LF_HF_Ratio_Corrected': lc.get('LF/HF', 0),
+            'VLF_Corrected': lc.get('VLF', _NAN), 'LF_Corrected': lc.get('LF', _NAN),
+            'HF_Corrected': lc.get('HF', _NAN), 'Total_Power_Corrected': lc.get('Total_Power', _NAN),
+            'LF_HF_Ratio_Corrected': lc.get('LF/HF', _NAN),
             'Quality_Corrected': lc.get('quality', 'unknown'),
         })
         lc2, lclean = metrics['freq_lomb_corrected'], metrics['freq_lomb_clean']
         freq_lomb_data.append({
             'Trial': trial_name,
-            'VLF_Clean': lclean.get('VLF', 0), 'LF_Clean': lclean.get('LF', 0),
-            'HF_Clean': lclean.get('HF', 0), 'Total_Power_Clean': lclean.get('Total_Power', 0),
-            'LF_HF_Ratio_Clean': lclean.get('LF/HF', 0),
+            'VLF_Clean': lclean.get('VLF', _NAN), 'LF_Clean': lclean.get('LF', _NAN),
+            'HF_Clean': lclean.get('HF', _NAN), 'Total_Power_Clean': lclean.get('Total_Power', _NAN),
+            'LF_HF_Ratio_Clean': lclean.get('LF/HF', _NAN),
             'Quality_Clean': lclean.get('quality', 'unknown'),
-            'VLF_Corrected': lc2.get('VLF', 0), 'LF_Corrected': lc2.get('LF', 0),
-            'HF_Corrected': lc2.get('HF', 0), 'Total_Power_Corrected': lc2.get('Total_Power', 0),
-            'LF_HF_Ratio_Corrected': lc2.get('LF/HF', 0),
+            'VLF_Corrected': lc2.get('VLF', _NAN), 'LF_Corrected': lc2.get('LF', _NAN),
+            'HF_Corrected': lc2.get('HF', _NAN), 'Total_Power_Corrected': lc2.get('Total_Power', _NAN),
+            'LF_HF_Ratio_Corrected': lc2.get('LF/HF', _NAN),
             'Quality_Corrected': lc2.get('quality', 'unknown'),
         })
         ctype = np.asarray(data['corrected_type'])
@@ -2834,10 +2898,18 @@ def load_recording(participant, state):
         if sfreq is None:
             sfreq = f_sfreq
         elif abs(f_sfreq - sfreq) > 1e-6:
-            print(f"  ⚠ {os.path.basename(f)}: sfreq {f_sfreq} ≠ {sfreq}; using per-file rate")
+            # RR intervals are measured in samples and converted with ONE rate, so every
+            # file must be on it (previously the file kept its own rate and its RR
+            # intervals were off by f_sfreq / sfreq).
+            print(f"  ⚠ {os.path.basename(f)}: sfreq {f_sfreq} ≠ {sfreq}; resampled to {sfreq} Hz")
+            r.resample(sfreq, verbose=False)
+            f_sfreq = sfreq
 
-        f_base = (pd.to_datetime(r.info['meas_date']).replace(tzinfo=None)
-                  if r.info['meas_date'] else pd.Timestamp.now().replace(tzinfo=None))
+        if not r.info['meas_date']:
+            # without a start time the samples cannot be placed on the sync log's clock
+            print(f"❌ {os.path.basename(f)} has no recording start time in its header. Skipping file.")
+            continue
+        f_base = pd.to_datetime(r.info['meas_date']).replace(tzinfo=None)
         fdf = r.to_data_frame(index='time')
         fdf.index = f_base + pd.to_timedelta(fdf.index, unit='s')
         per_file_dfs.append(fdf)
@@ -2847,7 +2919,22 @@ def load_recording(participant, state):
     if not per_file_dfs:
         return None
 
-    df_raw = pd.concat(per_file_dfs).sort_index()
+    # Files that overlap in time: keep the earlier file's samples and drop the later
+    # file's samples inside the overlap. Sorting the concatenated samples would
+    # otherwise interleave the two files' sample grids (only exactly equal time stamps
+    # were removed), doubling the sample density there and corrupting every RR
+    # interval measured in samples.
+    per_file_dfs.sort(key=lambda d: d.index[0])
+    trimmed, covered_to = [], None
+    for fdf in per_file_dfs:
+        if covered_to is not None and fdf.index[0] <= covered_to:
+            n_drop = int(np.sum(fdf.index <= covered_to))
+            print(f"  ⚠ overlapping EDF files: {n_drop / sfreq:.1f} s already covered by an earlier file dropped")
+            fdf = fdf[fdf.index > covered_to]
+        if len(fdf):
+            trimmed.append(fdf)
+            covered_to = fdf.index[-1] if covered_to is None else max(covered_to, fdf.index[-1])
+    df_raw = pd.concat(trimmed).sort_index()
     df_raw = df_raw[~df_raw.index.duplicated(keep='first')]
     df_raw.index = pd.DatetimeIndex(df_raw.index)
     base_time = df_raw.index[0]
@@ -2923,6 +3010,9 @@ def process_trial(seg, df_raw, sfreq, with_plots=False):
     or None when the window cannot be analysed."""
     trial_name = seg['name']
     t_start, t_stop = seg['start'], seg['stop']
+    if t_stop <= t_start:
+        print(f"  ⚠ {trial_name}: stop time is not after start time in the sync log")
+        return None
     if t_start > df_raw.index[-1] or t_stop < df_raw.index[0]:
         print(f"  ⚠ {trial_name}: window outside recording")
         return None
@@ -2977,7 +3067,8 @@ def process_trial(seg, df_raw, sfreq, with_plots=False):
                                              timing_bad=timing_window, alternating=alt_window,
                                              alternating_sustained=sus_window,
                                              recording_gap=hole_window)
-    hrv_results = calculate_hrv_metrics(valid_peaks_idx, sfreq, correction)  # same correction [D5]
+    hrv_results = calculate_hrv_metrics(valid_peaks_idx, sfreq, correction,  # same correction [D5]
+                                        sample_index=segment_padded.index)  # clock times across holes [D26]
     if hrv_results is None:
         return None
 
@@ -3254,14 +3345,24 @@ _TD_S = {'padding': '3px 10px', 'borderBottom': '1px solid #eee', 'fontSize': '1
 _TABLE_S = {'borderCollapse': 'collapse', 'width': '100%', 'marginTop': '6px', 'marginBottom': '10px'}
 
 
+def _fmt_num(v, spec):
+    """A number for the dashboard; '—' when it is missing or not computable
+    (None / NaN, [D17]) instead of 'nan' or a crash on None."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return '—'
+    return format(v, spec) if np.isfinite(v) else '—'
+
+
 def _time_row(label, raw_val, corr_val, unit):
     delta = corr_val - raw_val
     delta_color = '#27ae60' if delta >= 0 else '#c0392b'
     return html.Tr([
         html.Td(html.B(label), style=_TD_S),
-        html.Td(f"{raw_val:.1f}", style={**_TD_S, 'textAlign': 'right'}),
-        html.Td(html.B(f"{corr_val:.1f}"), style={**_TD_S, 'textAlign': 'right'}),
-        html.Td(f"{delta:+.1f}", style={**_TD_S, 'textAlign': 'right', 'color': delta_color}),
+        html.Td(_fmt_num(raw_val, '.1f'), style={**_TD_S, 'textAlign': 'right'}),
+        html.Td(html.B(_fmt_num(corr_val, '.1f')), style={**_TD_S, 'textAlign': 'right'}),
+        html.Td(_fmt_num(delta, '+.1f'), style={**_TD_S, 'textAlign': 'right', 'color': delta_color}),
         html.Td(unit, style={**_TD_S, 'color': '#888'}),
     ])
 
@@ -3270,7 +3371,7 @@ def _freq_row(label, power, peak):
     peak_str = f"{peak:.3f}" if isinstance(peak, float) else "—"
     return html.Tr([
         html.Td(html.B(label), style=_TD_S),
-        html.Td(f"{power:.2f}", style={**_TD_S, 'textAlign': 'right'}),
+        html.Td(_fmt_num(power, '.2f'), style={**_TD_S, 'textAlign': 'right'}),
         html.Td(peak_str, style={**_TD_S, 'textAlign': 'right'}),
     ])
 
@@ -3283,9 +3384,9 @@ def build_stats_panel(t_raw, t_corr, f_clean, method_name, total_beats,
     excl = f_clean.get('excluded_beats', 0)
     excl_rate = f_clean.get('exclusion_rate', 0)
     dur = f_clean.get('duration_sec', 0)
-    lf_hf = f_clean.get('LF/HF', 0)
-    lf_nu = f_clean.get('LF_nu', 0)
-    hf_nu = f_clean.get('HF_nu', 0)
+    lf_hf = f_clean.get('LF/HF', _NAN)
+    lf_nu = f_clean.get('LF_nu', _NAN)
+    hf_nu = f_clean.get('HF_nu', _NAN)
 
     badge_style = {
         'display': 'inline-block', 'padding': '1px 8px',
@@ -3379,18 +3480,18 @@ def build_stats_panel(t_raw, t_corr, f_clean, method_name, total_beats,
                 html.Th("Peak (Hz)", style={**_TH_S, 'textAlign': 'right'}),
             ])),
             html.Tbody([
-                _freq_row("VLF", f_clean.get('VLF', 0), f_clean.get('VLF_peak', 0)),
-                _freq_row("LF", f_clean.get('LF', 0), f_clean.get('LF_peak', 0)),
-                _freq_row("HF", f_clean.get('HF', 0), f_clean.get('HF_peak', 0)),
-                _freq_row("Total", f_clean.get('Total_Power', 0), "—"),
+                _freq_row("VLF", f_clean.get('VLF', _NAN), f_clean.get('VLF_peak', 0)),
+                _freq_row("LF", f_clean.get('LF', _NAN), f_clean.get('LF_peak', 0)),
+                _freq_row("HF", f_clean.get('HF', _NAN), f_clean.get('HF_peak', 0)),
+                _freq_row("Total", f_clean.get('Total_Power', _NAN), "—"),
             ]),
         ], style=_TABLE_S),
         html.Div([
-            html.Span(f"LF/HF: {lf_hf:.2f}",
+            html.Span(f"LF/HF: {_fmt_num(lf_hf, '.2f')}",
                       style={**badge_style, 'backgroundColor': '#eaf2ff', 'color': '#1a5276'}),
-            html.Span(f"LF(nu): {lf_nu:.1f}%",
+            html.Span(f"LF(nu): {_fmt_num(lf_nu, '.1f')}%",
                       style={**badge_style, 'backgroundColor': '#eaf2ff', 'color': '#1a5276'}),
-            html.Span(f"HF(nu): {hf_nu:.1f}%",
+            html.Span(f"HF(nu): {_fmt_num(hf_nu, '.1f')}%",
                       style={**badge_style, 'backgroundColor': '#eaf2ff', 'color': '#1a5276'}),
         ]),
 
@@ -3419,8 +3520,8 @@ def _benchmark_section(benchmark, n_unrecoverable, badge_style):
         vbg, vfg = _VERDICT_COLORS.get(r['verdict'], _VERDICT_COLORS['n/a'])
         return html.Tr([
             html.Td(html.B(metric), style=_TD_S),
-            html.Td(f"{r['custom']:.2f}", style={**_TD_S, 'textAlign': 'right'}),
-            html.Td(f"{(r['reference'] or 0):.2f}", style={**_TD_S, 'textAlign': 'right'}),
+            html.Td(_fmt_num(r['custom'], '.2f'), style={**_TD_S, 'textAlign': 'right'}),
+            html.Td(_fmt_num(r['reference'], '.2f'), style={**_TD_S, 'textAlign': 'right'}),
             html.Td(rd, style={**_TD_S, 'textAlign': 'right'}),
             html.Td(r['verdict'], style={**_TD_S, 'textAlign': 'center',
                                          'backgroundColor': vbg, 'color': vfg,
