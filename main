@@ -1,6 +1,6 @@
 """
 Scientific HRV analysis pipeline (ECG → R-peaks → RR → time/frequency HRV).
-Version 2.5 (3 Oct 2026) — refactor of GPR_Improved.py.
+Version 2.5 (4 Oct 2026) — refactor of GPR_Improved.py.
     2.1  waterfall plot removed from the dashboard.
     2.2  ectopic beats flag the right intervals [D13]; dashboard beat markers
          fixed [D14]; edge beats of a trial judged with neighbours [D15].
@@ -15,7 +15,12 @@ Version 2.5 (3 Oct 2026) — refactor of GPR_Improved.py.
          is flagged and excluded as a whole [D21]; RMSSD no longer bridges an
          excluded stretch [D22]; the bad beats are split into dropped /
          corrected / kept in the workbook, console and dashboard [D23];
-         slightly early beats the detector cannot see are counted [D24].
+         slightly early beats the detector cannot see are counted [D24];
+         a state can list several EDF file patterns, so P-001's and P-011's
+         ON 5-min sitting (recorded in separate rest files) is analysed
+         [D25]; a hole in the ECG recording inside a trial is excluded
+         instead of bridged [D26]; a trial can be read from another ECG lead
+         (P-015 OFF 5-min sitting from ECG 2, as its run sheet says) [D27].
 
 HOW TO RUN
     BATCH_MODE = True   every participant/state in PARTICIPANTS → one workbook each
@@ -23,8 +28,10 @@ HOW TO RUN
     DRY_RUN    = True   (default) nothing is written. Batch mode runs a fast
                         PREFLIGHT of every registry entry (EDF files found, ECG
                         channel present, sync log parsed, trial count, workbook to
-                        be written). Single mode processes and opens the dashboard
-                        but skips the workbook.
+                        be written) that also lists trials logged as under 5 s
+                        (placeholders), trials outside the EDF files and trials
+                        with part of the window unrecorded [D25, D26]. Single mode
+                        processes and opens the dashboard but skips the workbook.
     DRY_RUN    = False  process and write HRV_Analysis_<PID>_<STATE>.xlsx into
                         OUTPUT_DIR. File names are unchanged, so the R script only
                         needs HRV_DIR pointed at OUTPUT_DIR. The September
@@ -305,10 +312,13 @@ DECISIONS — VERSION 2 (numbered for the methods section / audit trail)
       was handled three ways in one trial: 12 % kept as normal-to-normal, 21 %
       replaced by smooth reconstructed beats, 67 % excluded as flagged
       stretches longer than 15 s (the beats the dashboard showed as removed).
-      Now a stretch where the beat-to-beat difference changes sign at least
-      8 times in a row (ALTERNATION_MIN_RUN) and every interval is ≥ 5 % from
-      the mean of its pair (ALTERNATION_MIN_AMP) is flagged as a whole
-      ('alternating rhythm') and excluded, never reconstructed — the rhythm
+      Now a stretch of at least 8 successive differences alternating in sign
+      (9 intervals, ALTERNATION_MIN_RUN), every interval ≥ 5 % from the mean
+      of its pair (ALTERNATION_MIN_AMP), whose short + long pairs span two
+      beats of the rhythm around it (≥ 1.5, ALTERNATION_PAIR_MIN_BEATS; a pair
+      holding one beat is an extra detection and is left to the extra-beat
+      rules), is flagged as a whole ('alternating rhythm', the intervals at
+      both ends included) and excluded, never reconstructed — the rhythm
       underneath is not observable there. ALTERNATION_HANDLING = 'keep'
       treats it as NN instead (a sensitivity run if a clinician reads P-014 as
       sinus rhythm; it keeps true bigeminy too), 'off' restores 2.4.
@@ -316,8 +326,10 @@ DECISIONS — VERSION 2 (numbered for the methods section / audit trail)
       the September data the rule also finds bigeminy runs that 2.4 flagged
       only partly (P-001 OFF, P-026 ON), noise already flagged (P-012 ON,
       P-021 ON walking), 10 % of P-023 OFF 5-min sitting (~830 / ~950 ms,
-      unflagged in 2.4) and 2 % of P-003 OFF 5-min walking (543 / 605 ms —
-      possibly steps pacing the heartbeat; walking trials only). Breathing
+      unflagged in 2.4), 3 % of P-011 OFF 5-min sitting (inside an irregular
+      stretch with premature beats; the trial is 71 % flagged anyway) and 2 %
+      of P-003 OFF 5-min walking (543 / 605 ms — possibly steps pacing the
+      heartbeat; walking trials only). Breathing
       does not trigger it unless a breath lasts about two beats with an RR
       swing of ≥ ±8 % (VALIDATION 20).
 [D22] Successive differences (2.5). RMSSD, SDSD and pNN50 of the corrected
@@ -329,8 +341,9 @@ DECISIONS — VERSION 2 (numbered for the methods section / audit trail)
       SDNN are unchanged. With fewer than 4 such differences RMSSD/SDSD/pNN50
       are left empty [D17]. Trials without an excluded stretch are unchanged.
 [D23] Where the bad beats went (2.5). Unique_Bad_Beats counts every beat that
-      touches a flagged interval or has an abnormal shape, so it mixes beats
-      that were dropped, moved and left alone. Data_Quality gains, at the end:
+      touches a flagged interval (the trial's first and last beats excepted)
+      or has an abnormal shape, so it mixes beats that were dropped, moved and
+      left alone. Data_Quality gains, at the end:
       Beats_Dropped = Dropped_Extra_Beats (extra beats removed) +
       Dropped_Excluded (beats inside stretches left out of the analysis, of
       which Excluded_Alternating for [D21]); Beats_Corrected (detected beats
@@ -359,14 +372,56 @@ DECISIONS — VERSION 2 (numbered for the methods section / audit trail)
       of its 49 trials) stand out. Breathing with large, fast swings (≥ ±8 % at
       ≤ 5 beats per breath) also produces hits, so by default nothing is
       flagged (EARLY_BEAT_HANDLING = 'report'); 'flag' treats them as
-      premature beats ([D18] then re-times them) — a decision for the study,
-      ideally after a clinician has read P-014's and P-015's strips
-      (VALIDATION 22).
+      premature beats (in 'kubios' mode [D18] usually adds the interval after
+      them, so the beat is re-timed) — a decision for the study, ideally
+      after a clinician has read P-014's and P-015's strips (VALIDATION 22).
+[D25] Several file patterns per state (2.5). P-001's and P-011's ON 5-min
+      sitting was recorded during the IART task, in separate files
+      (PD_P001_ON_State_Rest(1–3).edf, PD_HRV_P011_ON_Rest.edf: same ECG leads
+      at 256 Hz, plus an HR channel) that the ON pattern did not match. The
+      trial therefore lay outside the loaded recording and was skipped with
+      only a console line ('window outside recording'): no earlier workbook
+      has an ON sitting value for either participant. A state's registry
+      entry can now be a list of patterns; both participants list their rest
+      files. Nothing else falls in those files (VALIDATION 23). The preflight
+      now also lists, from the EDF headers, trials logged as under 5 s
+      (placeholders — e.g. the ON 5-min sitting of P-012, P-013 and P-014,
+      whose times are in the IART task files), trials outside the EDF files
+      and trials with part of the window unrecorded.
+[D26] Holes in the ECG recording (2.5). Where the Equivital was restarted,
+      two EDF files leave a gap of ~20–35 s and the samples on either side are
+      joined. In the EDF headers, 11 trials have such a hole inside the window
+      (5-min quiet trials: P-018 OFF sitting and standing, P-028 OFF
+      standing), 14 start or end outside the recording and 20 are not
+      recorded at all. RR intervals are measured in samples, so the interval
+      across a hole is not a heartbeat interval (1.1–4.7 s in samples, 33–37 s
+      in time); 2.4 treated it as missed beats — excluded when long enough,
+      otherwise filled with inserted beats (3 in P-028 OFF standing, 1 in
+      P-005 ON walking). Now an interval whose two beats are separated by a
+      jump in the ECG time stamps (> RECORDING_GAP_MIN_SEC) is flagged and its
+      run excluded ('recording gap' in Reconstruction_QC): nothing is
+      inserted and RMSSD does not bridge it [D22]. Data_Quality gains
+      Unrecorded_Seconds (seconds of the window without ECG: holes and edges)
+      and Recording_Gaps; the console and the dashboard warn from 2 s. The
+      'Raw' metrics still use the detected series as it is.
+      RECORDING_GAP_HANDLING = 'off' restores the previous handling (the
+      holes are still reported).
+[D27] Per-trial ECG lead (2.5). P-015's run sheet says "Use ECG 2 channel,
+      NOT ECG 1 for the 5 minutes of quiet sitting". On ECG 1 that trial loses
+      about a quarter of its beats (254 detected vs 340 on ECG 2; 103 vs 3
+      beats dropped in excluded stretches); its standing and walking trials
+      give the same beat counts on both leads (VALIDATION 23). The registry
+      can now name the lead for a trial ('ecg_channel': {'OFF_5min_Sitting':
+      'ECG 2'}). load_recording then reads that lead as well; if it is not
+      recorded throughout the window, the trial falls back to ECG_CHANNEL
+      with a console warning. Data_Quality reports ECG_Channel and Run_Config
+      the leads per trial. On ECG 2, detection is the same with and without
+      INVERT_ECG (340 beats either way).
 
 ────────────────────────────────────────────────────────────────────────────
 VALIDATION — sandbox. Items 1–12, 15, 16, 20 and 21 replay the RR series
 exported in the September workbooks or simulate events; items 13, 14, 17, 18,
-19 and 22 re-process the real EDF files.
+19, 22 and 23 re-process the real EDF files.
 ────────────────────────────────────────────────────────────────────────────
 Data: the 985 trials of the 25 Sep run (43 workbooks). The exact flagged-
 interval masks were recovered from the exported sheets (flag counts match
@@ -557,19 +612,24 @@ Version 2.4 (premature beats, short intervals, state filter — [D18]–[D20]):
     unchanged too.
 Version 2.5 (alternation, successive differences, breakdown — [D21]–[D24]):
 18. Real EDF files (read-only), 9 participants: those of item 13 plus P-014 and
-    P-016 (421 trials). 2.4 → 2.5: 31 trials change; beats counted in the
-    burden 11,380 → 11,629. In every trial Unique_Bad_Beats = dropped +
-    corrected + kept. All 9: 11,641 bad beats = 6,100 dropped (217 extra
-    beats, 5,883 in excluded stretches, 1,250 of them alternating rhythm) +
-    2,547 corrected + 2,994 kept; 24 beats inserted. Without P-014 and P-016:
-    5,554 = 612 dropped (210 extra, 402 excluded) + 2,167 corrected + 2,775
-    kept. Analysis inputs that change: P-001 OFF 5-min standing RMSSD 40.7 →
-    41.2 ms (two bigeminy runs excluded instead of reconstructed), P-014 ON
-    5-min standing 69.0 → 66.2 ms (burden 50.0 → 75.6 %), P-015 OFF 5-min
-    standing 75.0 → 73.4 ms, P-015 OFF 30s_T1 93.2 → 106.2 ms (burden 23.7 →
-    31.6 %), P-016 OFF 5-min standing 2.8 → 2.5 ms. The R script's 30 %
-    exclusions do not change (resting: P-001, P-009, P-010, P-014, P-015,
-    P-016; Aim 4: P-016, P-025; P-015's mean 30-s burden 12.4 → 13.2 %).
+    P-016. 2.4 → 2.5: 421 → 422 trials (P-001 ON 5-min sitting is new [D25]);
+    34 of the 421 change; beats counted in the burden 11,392 → 11,609. In
+    every trial Unique_Bad_Beats = dropped + corrected + kept. All 9: 11,611
+    bad beats = 6,003 dropped (218 extra beats, 5,785 in excluded stretches,
+    1,250 of them alternating rhythm) + 2,575 corrected + 3,033 kept; 14
+    beats inserted. Without P-014 and P-016: 5,524 = 515 dropped (211 extra,
+    304 excluded) + 2,195 corrected + 2,814 kept. Analysis inputs that
+    change: P-001 OFF 5-min standing RMSSD 40.7 → 41.2 ms (two bigeminy runs
+    excluded instead of reconstructed), P-014 ON 5-min standing 69.0 → 66.2
+    ms (burden 50.0 → 75.6 %), P-015 OFF 5-min standing 75.0 → 73.4 ms,
+    P-015 OFF 30s_T1 93.2 → 106.2 ms (burden 23.7 → 31.6 %), P-016 OFF 5-min
+    standing 2.8 → 2.5 ms; P-015 OFF 5-min sitting, now from ECG 2 [D27]:
+    RMSSD 140.1 → 96.9 ms, SDNN 120.6 → 77.3 ms, burden 69.7 → 42.6 %. A
+    recording hole is excluded in 5 trials [D26] (P-003 OFF Trial9 and ON
+    Trial10, P-009 ON Giladi shuffle, P-015 OFF 2-min VR standing and ON
+    2-min VR sitting). The R script's 30 % exclusions do not change
+    (resting: P-001, P-009, P-010, P-014, P-015, P-016; Aim 4: P-016, P-025;
+    P-015's mean 30-s burden 12.4 → 13.2 %).
 19. P-014 and P-016, from the ECG (both leads, 0.5–40 Hz). P-014: median beats
     ending a short vs a long interval have the same QRS and the same P wave
     (the early one ~10 ms earlier relative to the R peak); breathing from the
@@ -591,33 +651,66 @@ Version 2.5 (alternation, successive differences, breakdown — [D21]–[D24]):
     corrected series exactly. Breathing: no alternation at 2.3–15 beats per
     breath up to ±15 %, nor at 2.1–2.2 up to ±5 %; at ~2 beats per breath a
     swing ≥ ±8 % is indistinguishable from alternation. Item 9's frequent
-    ectopy: unchanged (detected 99.8 %, |RMSSD error| 12.6 / 11.6 %);
-    bigeminy now gives no value instead of RMSSD errors of 62–103 %; PVC
-    trigeminy 65 → 49 % (5-min), 53 → 48 % (30-s). The breakdown adds up in
-    all 985 September trials and in every run.
+    ectopy: unchanged (detected 99.8 / 99.9 %, |RMSSD error| 12.6 / 11.6 %,
+    5-min / 30-s); bigeminy now gives no value instead of RMSSD errors of
+    96 / 62 %; PVC trigeminy (96 % of intervals flagged) 65 → 49 % and
+    53 → 48 %, but now consistently low (median −47 %; 2.4: 0 % with a wider
+    spread — its bridging differences offset the smoother replaced values,
+    [D22] removes the first), and 12 of its 72 series have too few adjacent
+    NN differences for a value. The breakdown adds up in all 985 September
+    trials and in every run.
 21. September cohort (as item 10): flagged intervals 11,195 → 11,501;
-    excluded intervals 93 → 128; 38 trials change, 24 of them only through
-    [D22]. Sustained alternation in 19 trials (1,429 beats excluded): P-014
-    (11 trials), bigeminy runs in P-001 OFF and P-026 ON, noise already
-    flagged in P-012 ON and P-021 ON walking, P-023 OFF 5-min sitting (10 %),
-    P-003 OFF 5-min walking (2 %). Analysis inputs: P-001 OFF standing +1.4 %,
-    P-014 ON standing −4 % (burden 50 → 76 %); through [D22]: P-011 OFF 30s_T1
-    105.6 → 63.8 ms, P-011 ON 30s_T1 305.4 → 326.3 ms, P-016 OFF standing
-    14.9 → 2.1 ms. Exclusions unchanged; with 'keep', P-001 and P-014 would
-    fall below 30 % (resting).
+    excluded intervals 93 → 128; 38 trials change: 18 because their flags
+    change (all through [D21]), 20 with the same flags — 19 only through
+    [D22] (among them P-018 OFF 5-min sitting and standing, which have a
+    recording hole [D26]) and P-014 ON Giladi DTWalk, whose flagged stretch
+    is now excluded as alternating. Sustained alternation in 19 trials (1,429
+    beats excluded): P-014 (10 trials), bigeminy runs in P-001 OFF (3 trials)
+    and P-026 ON (2-min VR sitting), noise already flagged in P-012 ON and
+    P-021 ON walking, P-023 OFF 5-min sitting (10 %), P-011 OFF 5-min sitting
+    (3 %), P-003 OFF 5-min walking (2 %). Analysis inputs: P-001 OFF standing
+    +1.4 %, P-014 ON standing −4 % (burden 50 → 76 %); through [D22]: P-011
+    OFF 30s_T1 105.6 → 63.8 ms, P-011 ON 30s_T1 305.4 → 326.3 ms, P-016 OFF
+    standing 14.9 → 2.1 ms. Exclusions unchanged; with 'keep', P-001 and
+    P-014 would fall below 30 % (resting).
 22. Unflagged early beats [D24]: 0 % in 90 % of the 791 September trials
     with ≥ 30 intervals (95th percentile 0.2 %, 99th 3.3 %); P-014 OFF 5-min
     standing (18.9 %) is the only analysis input ≥ 5 % there. Real EDF:
     P-015 reaches 5–15 % in 18 of its 49 trials (OFF 30-s T1–T4, ON 30-s
     T2–T4, OFF 5-min standing). Simulated breathing: none up to ±5 %;
     ≥ ±8 % at ≤ 5 beats per breath produces hits, hence 'report' by
-    default. With EARLY_BEAT_HANDLING = 'flag' (8 real participants, 370
-    trials): 54 trials change; P-014 OFF standing RMSSD 83.9 → 27.5 ms (burden 3.7 → 59.4 %);
-    P-015's 30-s RMSSD −10 to −51 % (mean 30-s burden 13.2 → 28.5 %); P-001
-    OFF standing 41.2 → 35.6 ms; the 30 % exclusions do not change.
-NOT verified here: the EDF files of the other participants (9 were read:
-items 13 and 18). Run the DRY_RUN preflight, then the full batch with
-DRY_RUN = False, and point the R script's HRV_DIR at OUTPUT_DIR.
+    default. With EARLY_BEAT_HANDLING = 'flag' (8 real participants, 371
+    trials): 54 trials change; P-014 OFF standing RMSSD 83.9 → 27.5 ms
+    (burden 3.7 → 59.4 %); P-015's 30-s RMSSD −13 to −51 % (mean 30-s burden
+    13.2 → 28.5 %); P-001 OFF standing 41.2 → 35.6 ms; the 30 % exclusions
+    do not change.
+Version 2.5, files and leads ([D25]–[D27]):
+23. EDF headers of all 151 files of the 23 participants (read-only).
+    P-001's and P-011's ON 5-min sitting lie in their rest files (for P-001
+    also the IART task's 'Baseline 2', same times). From the ECG: P-001 ON
+    sitting 404 beats, 0.5 % flagged, RMSSD 10.6 ms; P-011 ON sitting 439
+    beats, none flagged, RMSSD 7.3 ms; every other trial of both recordings
+    is identical with and without the rest files. Holes [D26], from the ECG:
+    P-018 OFF 5-min sitting and standing — the run across the hole was
+    already excluded (missed beats over 5 s / more than 4), now as
+    'recording gap', metrics unchanged; P-028 OFF 5-min standing — 3
+    inserted beats become an excluded run, RMSSD 10.4 → 10.5 ms; P-005 ON
+    5-min walking — likewise 1 inserted beat, SDNN 21.7 → 21.3 ms. P-015 OFF on both
+    leads [D27]: sitting 254 beats on ECG 1 (103 dropped in excluded
+    stretches) vs 340 on ECG 2 (3 dropped); standing and walking have the
+    same beat counts on both leads (RMSSD within about 2 %). test_v25b.py: the
+    union of patterns; the interval across a hole marked exactly (also with
+    a beat on its first sample); nothing inserted across it, RMSSD not
+    bridged, 'off' identical to before; a synthetic recording with a 30-s
+    hole and 60 s of noise on ECG 1: Unrecorded_Seconds 30.0, the hole's run
+    excluded as 'recording gap', the trial set to ECG 2 read from ECG 2 (bad
+    beats 30 → 0), a lead missing from the files falls back with a warning,
+    and the preflight lists the trial.
+NOT verified here: processing the EDF files of the other participants (9
+were processed in full, items 13 and 18, and P-005 ON, P-011 ON, P-018 OFF
+and P-028 OFF for item 23; the headers of all 151 files were read). Run the
+DRY_RUN preflight, then the full batch with DRY_RUN = False, and point the R
+script's HRV_DIR at OUTPUT_DIR.
 ────────────────────────────────────────────────────────────────────────────
 """
 import glob
@@ -641,7 +734,7 @@ from sklearn.gaussian_process.kernels import ConstantKernel, RBF, RationalQuadra
 
 _trapz = getattr(np, 'trapezoid', getattr(np, 'trapz', None))
 
-PIPELINE_VERSION = '2.5 (2026-10-03)'
+PIPELINE_VERSION = '2.6 (2026-10-05)'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -651,12 +744,17 @@ PIPELINE_VERSION = '2.5 (2026-10-03)'
 # nothing else needs editing. Paths are built from BASE + the per-participant
 # entry, so if the drive is remounted elsewhere you only change BASE. Add a new
 # participant by adding one entry. 'on': None means no ON-state recording exists.
+# A state's entry may also be a LIST of glob patterns, when a session was recorded
+# under more than one file name [D25]. Optional 'ecg_channel': {trial: channel}
+# reads that trial from another ECG lead, e.g. when the run sheet says one lead
+# was poor for it [D27]; every other trial uses ECG_CHANNEL.
 BASE = r'/Volumes/neurocog$/projects/Neurocog_32_2025_ 47935_pd-hrv/4_Data/Participants'
 
 PARTICIPANTS = {
     'P-001': {'edf_subdir': 'Equivital/EDF',
               'off': 'P-001_OFF_State(*).edf',
-              'on': 'P-001_ON_State(*).edf',
+              # [D25] the ON 5-min sitting (IART 'Baseline 2', 10:42–10:47) is in the Rest files
+              'on': ['P-001_ON_State(*).edf', 'PD_P001_ON_State_Rest(*).edf'],
               'sync': 'Sync/SyncFile_Complete_Trial.csv',
               'trial_sheet': 'sub001_TrialRunSheet.csv'},
     'P-003': {'edf_subdir': 'Equivital/EDF',
@@ -691,7 +789,8 @@ PARTICIPANTS = {
               'trial_sheet': 'sub010_TrialRunSheet.csv'},
     'P-011': {'edf_subdir': 'Equivital/EDF',
               'off': 'PD_HRV_P011_OFF(*).edf',
-              'on': 'PD_HRV_P011_ON(*).edf',
+              # [D25] the ON 5-min sitting (10:47–10:52) is in the IART-session Rest file
+              'on': ['PD_HRV_P011_ON(*).edf', 'PD_HRV_P011_ON_Rest.edf'],
               'sync': 'Sync/P-011_ses-01_FullSession.csv',
               'trial_sheet': 'sub011_TrialRunSheet.csv'},
     'P-012': {'edf_subdir': 'Equivital/EDF',
@@ -717,7 +816,9 @@ PARTICIPANTS = {
               'off': 'P015_OFF(*).edf',  # these files also cover the ON session [D20]
               'on': 'P015_ON(*).edf',
               'sync': 'Sync/P-015_ses-01_sessionlog (2).csv',
-              'trial_sheet': 'sub015_TrialRunSheet.csv'},
+              'trial_sheet': 'sub015_TrialRunSheet.csv',
+              # [D27] run sheet: "Use ECG 2 channel, NOT ECG 1 for the 5 minutes of quiet sitting."
+              'ecg_channel': {'OFF_5min_Sitting': 'ECG 2'}},
     'P-016': {'edf_subdir': 'Equivital/EDF',
               'off': 'P016_OFF.edf',
               'on': 'P016_ON.edf',
@@ -776,12 +877,12 @@ PARTICIPANTS = {
 }
 
 # ── Selector: which participant + state to analyse (single mode) ─────────────
-PARTICIPANT = 'P-001'  # any key in PARTICIPANTS
-STATE = 'OFF'  # 'OFF' or 'ON'
+PARTICIPANT = 'P-021'  # any key in PARTICIPANTS
+STATE = 'ON'  # 'OFF' or 'ON'
 
 # ── Run mode / outputs ───────────────────────────────────────────────────────
-BATCH_MODE = False  # True: all participants/states → workbooks. False: PARTICIPANT/STATE + dashboard.
-DRY_RUN = False  # True: write nothing (batch = preflight only; single = no workbook). False: write.
+BATCH_MODE = True  # True: all participants/states → workbooks. False: PARTICIPANT/STATE + dashboard.
+DRY_RUN = True  # True: write nothing (batch = preflight only; single = no workbook). False: write.
 OUTPUT_DIR = '/Users/aecasagr/Desktop/PD_HRV/HRV_Values_v2'  # new folder; September files untouched
 
 
@@ -803,10 +904,21 @@ def resolve_participant_paths(participant, state):
     pdir = os.path.join(BASE, participant)
     return {
         'edf_dir': os.path.join(pdir, cfg['edf_subdir']),
-        'pattern': pattern,
+        'pattern': pattern,  # one glob pattern or a list of them [D25]
         'sync': os.path.join(pdir, cfg['sync']),
         'trial_sheet': os.path.join(pdir, cfg['trial_sheet']),
+        'ecg_channel': dict(cfg.get('ecg_channel') or {}),  # per-trial ECG lead [D27]
     }
+
+
+def find_edf_files(paths):
+    """[D25] The state's EDF files: every file matching its glob pattern, or any
+    of its patterns when the registry lists several. Sorted, no duplicates."""
+    pats = paths['pattern'] if isinstance(paths['pattern'], (list, tuple)) else [paths['pattern']]
+    found = set()
+    for pat in pats:
+        found.update(glob.glob(os.path.join(paths['edf_dir'], pat)))
+    return sorted(found)
 
 
 ECG_CHANNEL = 'ECG 1'
@@ -858,23 +970,34 @@ RR_REL_MIN_FRAC = 0.60  # [D19] an interval shorter than 60 % of the local rhyth
 #                         with the out-of-range intervals. None ⇒ off.
 RHYTHM_HALF_WINDOW = 15  # [D19] local rhythm = median of the unflagged intervals within ±15
 #                          intervals (also [D18]'s fallback when < 3 NN intervals precede a run)
-ALTERNATION_HANDLING = 'exclude'  # [D21] sustained short–long alternation (a bigeminal rhythm):
-#                                   'exclude' (default) flags the whole stretch and leaves it out,
-#                                   not reconstructed. 'keep' treats it as normal-to-normal (a
-#                                   sensitivity run, e.g. if a clinician reads the strip as sinus
-#                                   rhythm; it also keeps true bigeminy). 'off' = 2.4 behaviour.
+ALTERNATION_HANDLING = 'auto'  # [D21, D28] short–long alternation (a bigeminal rhythm) is flagged; then
+#                                'auto' (default): a SHORT stretch inside normal rhythm is corrected like any
+#                                premature beats (every beat kept and re-timed, values from the rhythm
+#                                around it); a SUSTAINED one — longer than MAX_REPLACE_RUN_SEC, or where
+#                                alternation fills ≥ ALTERNATION_SUSTAINED_FRAC of the beats around it, or
+#                                at the edge of the recording — is left out, not reconstructed.
+#                                'exclude': every stretch left out (2.5). 'keep': treated as
+#                                normal-to-normal (a sensitivity run, e.g. if a clinician reads the strip
+#                                as sinus rhythm; it also keeps true bigeminy). 'off' = 2.4 behaviour.
 ALTERNATION_MIN_AMP = 0.05  # [D21] each interval ≥ 5 % above or below the mean of its pair …
 ALTERNATION_MIN_RUN = 8  # [D21] … for 8 successive differences alternating in sign (9 intervals) …
 ALTERNATION_PAIR_MIN_BEATS = 1.5  # [D21] … and each short + long pair spanning ≥ 1.5 beats of the rhythm
 #                                   around the stretch (two beats: bigeminy). A pair holding ONE beat is
 #                                   a beat split by an extra detection — left to the extra-beat rules.
+ALTERNATION_CONTEXT_BEATS = 30  # [D28] intervals looked at on each side of a stretch …
+ALTERNATION_SUSTAINED_FRAC = 0.25  # [D28] … the stretch is sustained if ≥ 25 % of them alternate too
 EARLY_CHECK_FRAC = 0.90  # [D24] QC only (nothing is flagged): an UNFLAGGED interval < 90 % of the local
 #                          median (9 intervals) whose neighbours are both ≥ 95 % of it ends in a slightly
 #                          early beat — a late premature beat below the detector's 20 % resolution.
 EARLY_CHECK_WARN_PCT = 5.0  # [D24] warn (console + dashboard) when ≥ 5 % of a trial's intervals are such
 EARLY_BEAT_HANDLING = 'report'  # [D24] 'report' (default): count them only (Data_Quality:
 #                                 Unflagged_Early_Beats_Percent). 'flag': treat them as premature beats
-#                                 (both intervals flagged, the beat re-timed, as in [D18]).
+#                                 (flagged; [D18] usually adds the interval after them).
+RECORDING_GAP_HANDLING = 'exclude'  # [D26] where the ECG RECORDING has a hole inside a trial (the Equivital
+#                                     was restarted, leaving ~30 s between two EDF files), the interval across
+#                                     the hole is excluded — never bridged or filled with inserted beats.
+#                                     'off' = previous behaviour (the samples either side are simply joined).
+RECORDING_GAP_MIN_SEC = 0.5  # [D26] a jump between consecutive ECG time stamps longer than this is a hole
 MIN_SEGMENT_DURATION = 120
 ADAPTIVE_EPOCH = True
 EPOCH_POST_RR_FRACTION = 0.65
@@ -1360,8 +1483,11 @@ def _alternation_mask(rr_ms):
     ALTERNATION_PAIR_MIN_BEATS × the median of up to 15 intervals on either
     side; with fewer than 3 such intervals it is taken as two). Breathing
     cannot do this (it spans 3–6 beats); a bigeminal rhythm does — an early
-    beat every other beat, however normal each beat looks. The intervals at
-    both ends of the stretch are included."""
+    beat every other beat, however normal each beat looks. [D28] The stretch
+    starts at its first SHORT interval (the one ending the first early beat):
+    the longer interval before it is the normal interval before that beat and
+    is not part of it. If the stretch ends on a short interval, the interval
+    after that last early beat is included."""
     rr_ms = np.asarray(rr_ms, dtype=float)
     n = len(rr_ms)
     out = np.zeros(n, dtype=bool)
@@ -1383,17 +1509,83 @@ def _alternation_mask(rr_ms):
             pairs = rr_ms[a:b] + rr_ms[a + 1:b + 1]
             if (len(outside) < 3 or not ALTERNATION_PAIR_MIN_BEATS
                     or np.median(pairs) >= ALTERNATION_PAIR_MIN_BEATS * np.median(outside)):
-                out[a:b + 1] = True
+                s, e = a, b
+                if rr_ms[s] > rr_ms[s + 1]:  # [D28] the normal interval before the first early beat
+                    s += 1
+                if rr_ms[e] < rr_ms[e - 1] and e + 1 < n:  # [D28] … and the one after the last early beat
+                    e += 1
+                out[s:e + 1] = True
         i = j + 1
+    return out
+
+
+def _true_runs(mask):
+    """(start, end) index pairs of the runs of True in a boolean array (end inclusive)."""
+    m = np.asarray(mask, dtype=bool)
+    if not m.any():
+        return []
+    d = np.diff(np.r_[0, m.astype(np.int8), 0])
+    return list(zip(np.where(d == 1)[0], np.where(d == -1)[0] - 1))
+
+
+def _alternation_sustained(rr_ms, alt):
+    """[D28] (n,) bool: the alternation stretches that cannot be corrected like
+    premature beats, because the rhythm underneath is not observable around
+    them: longer than MAX_REPLACE_RUN_SEC, or ≥ ALTERNATION_SUSTAINED_FRAC of
+    the ALTERNATION_CONTEXT_BEATS intervals on either side alternate too (a
+    bigeminal rhythm broken up only briefly, as in P-014), or fewer than 3
+    intervals between the stretch and the start or end of the series, or fewer
+    than 15 context intervals in all. Every other stretch is short and sits in
+    normal rhythm (P-001's runs of four or five early beats): it is corrected."""
+    rr_ms = np.asarray(rr_ms, dtype=float)
+    alt = np.asarray(alt, dtype=bool)
+    n = len(alt)
+    out = np.zeros(n, dtype=bool)
+    c = int(ALTERNATION_CONTEXT_BEATS)
+    for s, e in _true_runs(alt):
+        lo, hi = max(0, s - c), min(n, e + 1 + c)
+        ctx = np.r_[np.arange(lo, s), np.arange(e + 1, hi)].astype(int)
+        frac = float(alt[ctx].mean()) if len(ctx) else 1.0
+        if (rr_ms[s:e + 1].sum() / 1000.0 > MAX_REPLACE_RUN_SEC or s - lo < 3 or hi - e - 1 < 3
+                or len(ctx) < 15 or frac >= ALTERNATION_SUSTAINED_FRAC):
+            out[s:e + 1] = True
     return out
 
 
 def _check_options():
     """Typos in the 2.5 switches must not fall back silently to another behaviour."""
-    if ALTERNATION_HANDLING not in ('exclude', 'keep', 'off'):
-        raise ValueError(f"ALTERNATION_HANDLING must be 'exclude', 'keep' or 'off', got {ALTERNATION_HANDLING!r}")
+    if ALTERNATION_HANDLING not in ('auto', 'exclude', 'keep', 'off'):
+        raise ValueError(f"ALTERNATION_HANDLING must be 'auto', 'exclude', 'keep' or 'off', got {ALTERNATION_HANDLING!r}")
     if EARLY_BEAT_HANDLING not in ('report', 'flag'):
         raise ValueError(f"EARLY_BEAT_HANDLING must be 'report' or 'flag', got {EARLY_BEAT_HANDLING!r}")
+    if RECORDING_GAP_HANDLING not in ('exclude', 'off'):
+        raise ValueError(f"RECORDING_GAP_HANDLING must be 'exclude' or 'off', got {RECORDING_GAP_HANDLING!r}")
+
+
+def recording_gap_intervals(sample_index, peak_positions):
+    """[D26] (m,) bool, one per beat interval: True where the ECG recording has
+    a hole (consecutive time stamps more than RECORDING_GAP_MIN_SEC apart, i.e.
+    two EDF files with a gap between them) between the interval's two beats.
+    Such an interval measured in samples is not a heartbeat interval at all."""
+    pk = np.asarray(peak_positions, dtype=np.int64)
+    out = np.zeros(max(len(pk) - 1, 0), dtype=bool)
+    if len(pk) < 2:  # detected under any setting (QC); only 'exclude' acts on it
+        return out
+    ns = pd.DatetimeIndex(sample_index).asi8
+    jumps = np.where(np.diff(ns) > RECORDING_GAP_MIN_SEC * 1e9)[0]  # hole after sample j
+    for j in jumps:
+        k = int(np.searchsorted(pk, j + 1))  # first beat at or after the first sample past the hole
+        if 1 <= k < len(pk):
+            out[k - 1] = True
+    return out
+
+
+def unrecorded_seconds(sample_index, t_start, t_stop, sfreq):
+    """[D26] Seconds of the trial window with no ECG samples (holes between EDF
+    files, or a window that runs past the start/end of the recording)."""
+    idx = pd.DatetimeIndex(sample_index)
+    n_in = int(np.sum((idx >= t_start) & (idx <= t_stop)))
+    return max(0.0, (t_stop - t_start).total_seconds() - n_in / float(sfreq))
 
 
 def classify_rr_outlier_reasons(rr_ms):
@@ -1406,9 +1598,11 @@ def classify_rr_outlier_reasons(rr_ms):
     RR_REL_MIN_FRAC × the local rhythm [D19]. In 'kubios' mode (2.4) the
     interval after a premature beat that the classes left unflagged is added
     to 'ectopic' [D18]; neither rule relabels an interval already flagged.
-    'alternating' (2.5) = a sustained short–long alternation [D21]: with
-    ALTERNATION_HANDLING = 'exclude' the whole stretch is flagged under this
-    label; with 'keep' every flag inside it except 'hard' is cleared.
+    'alternating' (2.5) = a short–long alternation [D21]: with
+    ALTERNATION_HANDLING = 'auto' or 'exclude' the whole stretch is flagged
+    under this label (whether it is then corrected or left out is decided in
+    the correction [D28]); with 'keep' every flag inside it except 'hard' is
+    cleared.
     Morphology (per-PEAK) is handled separately at the call site."""
     _check_options()
     rr_ms = np.asarray(rr_ms, dtype=float)
@@ -1416,7 +1610,7 @@ def classify_rr_outlier_reasons(rr_ms):
     hard = (rr_ms < MIN_RR_MS) | (rr_ms > MAX_RR_MS) if n else np.zeros(n, dtype=bool)
     handling = ALTERNATION_HANDLING
     alt = _alternation_mask(rr_ms) if handling != 'off' else np.zeros(n, dtype=bool)
-    exclude_alt = handling == 'exclude' and bool(alt.any())
+    exclude_alt = handling in ('auto', 'exclude') and bool(alt.any())  # flagged; [D28] decides the handling
 
     if DETECTION_METHOD == 'kubios' and n >= 4:
         masks = kubios_interval_masks(rr_ms)
@@ -1501,7 +1695,7 @@ def _interval_masks(peak_indices, fs, ectopic_mask=None, timing_bad=None):
     return bad, timing_bad, rr
 
 
-def plan_correction_runs(peak_indices, fs, bad, excluded=None):
+def plan_correction_runs(peak_indices, fs, bad, excluded=None, recording_gap=None, early_beats=None):
     """Classify every maximal run of flagged intervals. Shared by
     perform_artifact_correction() and diagnose_gaps(), so the diagnostic can
     never disagree with what the correction does. (Logic unchanged from the
@@ -1518,8 +1712,16 @@ def plan_correction_runs(peak_indices, fs, bad, excluded=None):
                'merged'   k < L             (extra beats)
                'replaced' k == L            (right count, outlier values)
     A run containing any interval of `excluded` (a sustained alternation,
-    [D21]) is 'gap' whatever its length. Every 'gap' run records why it was
-    excluded ('exclusion_reason').
+    [D21]) or of `recording_gap` (a hole in the ECG recording, [D26]) is 'gap'
+    whatever its length. Every 'gap' run records why it was excluded
+    ('exclusion_reason').
+    `early_beats` [D28]: intervals of a SHORT alternation stretch (premature
+    beats in bigeminy, to be corrected). Every early beat is a real beat, so
+    those intervals keep their count: k = their number + round(rest / target)
+    for the run's other flagged intervals. Otherwise early beats that reset
+    the sinus node (a short + long pair spanning ~1.8 beats, P-001) add up to
+    fewer whole beats than intervals and the run would be read as extra
+    beats ('merged'), deleting real beats.
     Returns (runs, rr, local_median, global_med); rr in samples (float)."""
     peak_indices = np.asarray(peak_indices)
     bad = np.asarray(bad, dtype=bool)
@@ -1554,10 +1756,23 @@ def plan_correction_runs(peak_indices, fs, bad, excluded=None):
         if target <= 0:
             target = global_med
         k = max(1, int(round(gap / target))) if target > 0 else 1
+        eb = (np.asarray(early_beats[run_s:run_e], dtype=bool).copy() if early_beats is not None
+              else np.zeros(L, dtype=bool))
+        rr_run = rr[run_s:run_e]
+        for a in np.where(eb)[0]:  # a beat split by an extra detection is not an early beat:
+            if (eb[a] and a + 1 < L and eb[a + 1] and rr_run[a] + rr_run[a + 1] < 1.25 * target
+                    and min(rr_run[a], rr_run[a + 1]) < 0.5 * target):
+                eb[a] = eb[a + 1] = False  # … leave that pair to the count below
+        n_early = int(np.sum(eb))
+        if n_early and target > 0:  # [D28] the early beats' intervals keep their count
+            rest = gap - float(np.sum(rr_run[eb]))
+            k = max(1, n_early + int(round(max(rest, 0.0) / target)))
         beats_to_insert = k - L
         gap_sec = gap / fs
         reason = ''
-        if excluded is not None and np.any(excluded[run_s:run_e]):
+        if recording_gap is not None and np.any(recording_gap[run_s:run_e]):
+            reason = 'recording gap'
+        elif excluded is not None and np.any(excluded[run_s:run_e]):
             reason = 'alternating rhythm'
         elif beats_to_insert > MAX_MISSED_BEATS:
             reason = f'more than {MAX_MISSED_BEATS} missed beats'
@@ -1575,7 +1790,8 @@ def plan_correction_runs(peak_indices, fs, bad, excluded=None):
             action = 'replaced'
         runs.append({'run_s': run_s, 'run_e': run_e, 'L': L, 'k': k, 'gap': gap,
                      'target': target, 'beats_to_insert': beats_to_insert,
-                     'span_sec': gap_sec, 'action': action, 'exclusion_reason': reason})
+                     'span_sec': gap_sec, 'action': action, 'exclusion_reason': reason,
+                     'early_beats': n_early})
     return runs, rr, local_median, global_med
 
 
@@ -1618,7 +1834,8 @@ def _gpr_fit_predict(x_train, y_train, x_query):
         return None, None, f'GP fit failed: {e}'
 
 
-def perform_artifact_correction(peak_indices, fs, combined_bad_mask=None, timing_bad=None, alternating=None):
+def perform_artifact_correction(peak_indices, fs, combined_bad_mask=None, timing_bad=None, alternating=None,
+                                recording_gap=None, alternating_sustained=None):
     """Reconstruct an RR series from detected peaks. Run classification is
     unchanged (see plan_correction_runs); what changed is how VALUES are filled
     and where the reconstructed beats are placed:
@@ -1683,12 +1900,18 @@ def perform_artifact_correction(peak_indices, fs, combined_bad_mask=None, timing
                                        removed as an extra beat) or 'excluded'
       breakdown         dict    the flagged beats split by what happened to them
                                        ([D23]; see _beat_breakdown)
-    `alternating` (m,) bool: intervals in a sustained alternation [D21];
-    process_trial() passes it from the padded beat series, otherwise it is
-    computed here.
+    `alternating` (m,) bool: intervals in an alternation stretch [D21], and
+    `alternating_sustained` (m,) bool: those of them in sustained stretches
+    [D28]; process_trial() passes both from the padded beat series, otherwise
+    they are computed here. With ALTERNATION_HANDLING = 'auto', sustained
+    stretches are excluded and short ones corrected with their beats kept.
+    `recording_gap` (m,) bool: intervals spanning a hole in the ECG recording
+    [D26] (process_trial() passes it). They are flagged and their run is
+    excluded ('recording gap'), so nothing is inserted across the hole.
     """
     if RR_SUM_CONSTRAINT not in ('detection', 'all', 'none'):
         raise ValueError(f"RR_SUM_CONSTRAINT must be 'detection', 'all' or 'none', got {RR_SUM_CONSTRAINT!r}")
+    _check_options()
     peak_indices = np.asarray(peak_indices)
     n = len(peak_indices)
     if n < 5:
@@ -1706,9 +1929,26 @@ def perform_artifact_correction(peak_indices, fs, combined_bad_mask=None, timing
     bad, timing_bad, _rr = _interval_masks(peak_indices, fs, combined_bad_mask, timing_bad)
     if alternating is None or len(alternating) != n - 1:
         alternating = _alternation_mask(np.diff(peak_indices) / fs * 1000.0)
+        alternating_sustained = None
     alternating = np.asarray(alternating, dtype=bool)
+    if alternating_sustained is None or len(alternating_sustained) != n - 1:
+        alternating_sustained = _alternation_sustained(np.diff(peak_indices) / fs * 1000.0, alternating)
+    alternating_sustained = np.asarray(alternating_sustained, dtype=bool) & alternating
+    if ALTERNATION_HANDLING == 'exclude':
+        alt_excl, alt_keep = alternating, None
+    elif ALTERNATION_HANDLING == 'auto':  # [D28]
+        alt_excl, alt_keep = alternating_sustained, alternating & ~alternating_sustained
+    else:
+        alt_excl = alt_keep = None
+    rec_gap = (np.asarray(recording_gap, dtype=bool)
+               if recording_gap is not None and len(recording_gap) == n - 1 and RECORDING_GAP_HANDLING == 'exclude'
+               else np.zeros(n - 1, dtype=bool))
+    if rec_gap.any():  # [D26] an interval across a recording hole is never a heartbeat interval
+        bad = bad | rec_gap
+        timing_bad = timing_bad | rec_gap
     runs, rr, local_median, global_med = plan_correction_runs(
-        peak_indices, fs, bad, excluded=(alternating & bad) if ALTERNATION_HANDLING == 'exclude' else None)
+        peak_indices, fs, bad, excluded=(alt_excl & bad) if alt_excl is not None else None,
+        recording_gap=rec_gap, early_beats=(alt_keep & bad) if alt_keep is not None else None)
     n_rr = len(rr)
 
     # ── [D8] beat-order axis ────────────────────────────────────────────────
@@ -1846,6 +2086,10 @@ def perform_artifact_correction(peak_indices, fs, combined_bad_mask=None, timing
         j = run_e
         r_i += 1
 
+    for run in runs:  # [D28] say so in Reconstruction_QC
+        if run.get('early_beats') and run['action'] != 'gap':
+            run['values_from'] = (run.get('values_from') or '') + \
+                f" — {run['early_beats']} intervals of a short alternating stretch: early beats kept and re-timed [D28]"
     reconstructed = np.concatenate([[float(peak_indices[0])], np.asarray(ends, dtype=float)])
     reconstructed = np.maximum.accumulate(reconstructed)  # numerical safety (no-op normally)
 
@@ -1874,8 +2118,9 @@ def perform_artifact_correction(peak_indices, fs, combined_bad_mask=None, timing
             'corrected_type': np.asarray(types, dtype='<U8'),
             'posterior_sd': np.asarray(sds, dtype=float), 'runs': runs, 'gpr_fit': gpr_fit,
             'beat_fate': beat_fate,
-            'breakdown': _beat_breakdown(n, runs, unique_bad, alternating,
-                                         _unflagged_early_mask(np.diff(peak_indices) / fs * 1000.0, bad))}
+            'breakdown': _beat_breakdown(n, runs, unique_bad, alternating, early_kept=alt_keep,
+                                         unflagged_early=_unflagged_early_mask(
+                                             np.diff(peak_indices) / fs * 1000.0, bad))}
 
 
 def _unflagged_early_mask(rr_ms, bad):
@@ -1896,7 +2141,7 @@ def _unflagged_early_mask(rr_ms, bad):
     return out & ~np.asarray(bad, dtype=bool)
 
 
-def _beat_breakdown(n, runs, unique_bad, alternating, unflagged_early=None):
+def _beat_breakdown(n, runs, unique_bad, alternating, unflagged_early=None, early_kept=None):
     """[D23] The flagged ('bad') beats split by what the correction did with
     them. A bad beat is either INSIDE a flagged run (both of its intervals
     flagged) or one of the two real beats that bound a run.
@@ -1911,9 +2156,11 @@ def _beat_breakdown(n, runs, unique_bad, alternating, unflagged_early=None):
     Beats INSERTED for missed beats were never detected, so they are counted
     separately and are not part of Unique_Bad_Beats.
     unique_bad = dropped + corrected + kept. Also writes the per-run counts into
-    each run (Reconstruction_QC)."""
+    each run (Reconstruction_QC). corrected_alternating [D28]: of the corrected
+    beats, those ending an interval of a short alternation stretch (`early_kept`)."""
     unique_bad = np.asarray(unique_bad, dtype=bool)
-    d_extra = d_excl = d_alt = corrected = inserted = kept_runs = 0
+    ek = np.asarray(early_kept, dtype=bool) if early_kept is not None else None
+    d_extra = d_excl = d_alt = corrected = inserted = kept_runs = c_alt = 0
     for r in runs:
         L, k = r['L'], r['k']
         inner = max(0, L - 1)
@@ -1931,6 +2178,8 @@ def _beat_breakdown(n, runs, unique_bad, alternating, unflagged_early=None):
             d, c, i = 0, inner, 0
         corrected += c
         inserted += i
+        if ek is not None and r['action'] != 'gap' and len(ek):
+            c_alt += int(np.sum(ek[r['run_s']:max(r['run_s'], r['run_e'] - 1)]))
         kb = int(unique_bad[r['run_s']]) + int(unique_bad[r['run_e']]) if n else 0
         kept_runs += kb
         r.update(beats_dropped=d, beats_corrected=c, beats_inserted=i, bad_beats_kept=kb)
@@ -1939,13 +2188,15 @@ def _beat_breakdown(n, runs, unique_bad, alternating, unflagged_early=None):
     alternating = np.asarray(alternating, dtype=bool)
     ue = np.asarray(unflagged_early if unflagged_early is not None else np.zeros(len(alternating)), dtype=bool)
     return {'unique_bad': n_bad, 'dropped': dropped, 'dropped_extra': d_extra, 'dropped_excluded': d_excl,
-            'excluded_alternating': d_alt, 'corrected': corrected, 'inserted': inserted,
+            'excluded_alternating': d_alt, 'corrected': corrected, 'corrected_alternating': c_alt,
+            'inserted': inserted,
             'kept': n_bad - dropped - corrected, 'kept_check': kept_runs,
             'alternating_pct': float(100.0 * alternating.mean()) if len(alternating) else 0.0,
             'unflagged_early_pct': float(100.0 * ue.mean()) if len(ue) else 0.0}
 
 
-def diagnose_gaps(peak_indices, fs, ectopic_mask=None, verbose=True, timing_bad=None):
+def diagnose_gaps(peak_indices, fs, ectopic_mask=None, verbose=True, timing_bad=None, alternating=None,
+                  recording_gap=None, alternating_sustained=None):
     """Explain every flagged run and WHY it was classified as it was — the tool
     to run when 'unrecoverable gap' shows up and you want to know the cause.
 
@@ -1961,9 +2212,30 @@ def diagnose_gaps(peak_indices, fs, ectopic_mask=None, verbose=True, timing_bad=
     peak_indices = np.asarray(peak_indices)
     bad, timing_bad, _rr = _interval_masks(peak_indices, fs, ectopic_mask, timing_bad)
     morph_only = bad & ~timing_bad
-    alt = _alternation_mask(np.diff(peak_indices) / fs * 1000.0)
+    # pass `alternating` (and `timing_bad`) from the padded series, as process_trial
+    # does for the correction, or the plan can differ at the window's edges
+    given = alternating is not None and len(alternating) == len(bad)
+    alt = (np.asarray(alternating, dtype=bool) if given
+           else _alternation_mask(np.diff(peak_indices) / fs * 1000.0))
+    sus = (np.asarray(alternating_sustained, dtype=bool)
+           if given and alternating_sustained is not None and len(alternating_sustained) == len(bad)
+           else _alternation_sustained(np.diff(peak_indices) / fs * 1000.0, alt)) & alt
+    if ALTERNATION_HANDLING == 'exclude':  # as in perform_artifact_correction [D28]
+        alt_excl, alt_keep = alt, None
+    elif ALTERNATION_HANDLING == 'auto':
+        alt_excl, alt_keep = sus, alt & ~sus
+    else:
+        alt_excl = alt_keep = None
+    rg = (np.asarray(recording_gap, dtype=bool)
+          if recording_gap is not None and len(recording_gap) == len(bad) and RECORDING_GAP_HANDLING == 'exclude'
+          else np.zeros(len(bad), dtype=bool))
+    bad = bad | rg  # [D26] as in perform_artifact_correction
+    timing_bad = timing_bad | rg
+    morph_only = bad & ~timing_bad
     plan, *_ = plan_correction_runs(peak_indices, fs, bad,
-                                    excluded=(alt & bad) if ALTERNATION_HANDLING == 'exclude' else None)
+                                    excluded=(alt_excl & bad) if alt_excl is not None else None,
+                                    recording_gap=rg,
+                                    early_beats=(alt_keep & bad) if alt_keep is not None else None)
     runs = []
     for r in plan:
         n_morph = int(np.sum(morph_only[r['run_s']:r['run_e']]))
@@ -1998,7 +2270,9 @@ def calculate_time_domain_hrv(rr_ms, contiguous=None):
         return {'HR': nan, 'SDNN': nan, 'RMSSD': nan, 'SDSD': nan, 'pNN50': nan, 'NN_count': len(rr_ms)}
     rr_ms = np.asarray(rr_ms, dtype=float)
     diff_rr = np.diff(rr_ms)
-    if contiguous is not None and len(contiguous) == len(diff_rr):
+    if contiguous is not None:
+        if len(contiguous) != len(diff_rr):
+            raise ValueError(f"contiguous has {len(contiguous)} entries, expected {len(diff_rr)}")
         diff_rr = diff_rr[np.asarray(contiguous, dtype=bool)]
     out = {'HR': 60000 / np.mean(rr_ms), 'SDNN': np.std(rr_ms, ddof=1),
            'RMSSD': nan, 'SDSD': nan, 'pNN50': nan, 'NN_count': len(rr_ms)}
@@ -2306,8 +2580,11 @@ def _run_config_rows(run_info):
     for name in ('DETECTION_METHOD', 'KUBIOS_ALPHA', 'KUBIOS_MRRS_THRESH', 'KUBIOS_TH_FLOOR_MS',
                  'KUBIOS_TH_CEIL_FRAC', 'KUBIOS_WINDOW_BEATS', 'KUBIOS_MEDFILT', 'KUBIOS_C1', 'KUBIOS_C2',
                  'PREMATURE_MIN_FRAC', 'PREMATURE_GRID_TOL', 'RR_REL_MIN_FRAC', 'RHYTHM_HALF_WINDOW',
-                 'ALTERNATION_HANDLING', 'ALTERNATION_MIN_AMP', 'ALTERNATION_MIN_RUN', 'EARLY_CHECK_FRAC',
+                 'ALTERNATION_HANDLING', 'ALTERNATION_MIN_AMP', 'ALTERNATION_MIN_RUN',
+                 'ALTERNATION_PAIR_MIN_BEATS', 'ALTERNATION_CONTEXT_BEATS', 'ALTERNATION_SUSTAINED_FRAC',
+                 'EARLY_CHECK_FRAC',
                  'EARLY_CHECK_WARN_PCT', 'EARLY_BEAT_HANDLING',
+                 'RECORDING_GAP_HANDLING', 'RECORDING_GAP_MIN_SEC',
                  'MORPHOLOGY_CORRELATION_THRESHOLD', 'MIN_RR_MS', 'MAX_RR_MS', 'MEDIAN_WINDOW',
                  'MAX_MISSED_BEATS', 'MAX_GAP_RECONSTRUCT_SEC', 'MAX_REPLACE_RUN_SEC',
                  'RR_FILL_METHOD', 'RR_SUM_CONSTRAINT', 'RR_SUM_MAX_OFFSET', 'GPR_KERNEL', 'GPR_N_RESTARTS',
@@ -2415,10 +2692,14 @@ def export_hrv_to_excel(processed_data, output_path, run_info=None):
             'Dropped_Excluded': bd.get('dropped_excluded'),  # … inside stretches left out of the analysis
             'Excluded_Alternating': bd.get('excluded_alternating'),  # … of which alternating rhythm [D21]
             'Beats_Corrected': bd.get('corrected'),          # moved to the reconstructed position
+            'Corrected_Alternating': bd.get('corrected_alternating'),  # … of which early beats of a short alternation [D28]
             'Bad_Beats_Kept': bd.get('kept'),                # flagged but left in place (run boundaries)
             'Beats_Inserted': bd.get('inserted'),            # missed beats added (not detected beats)
             'Alternating_Rhythm_Percent': bd.get('alternating_pct'),  # [D21] % of intervals, any handling
             'Unflagged_Early_Beats_Percent': bd.get('unflagged_early_pct'),  # [D24] QC: possible late premature beats
+            'Unrecorded_Seconds': round(float(data.get('unrecorded_s', 0.0)), 1),  # [D26] window with no ECG
+            'Recording_Gaps': data.get('recording_gaps', 0),  # [D26] holes between EDF files inside the window
+            'ECG_Channel': data.get('ecg_channel', ECG_CHANNEL),  # [D27] lead this trial was read from
         })
         bench = metrics.get('benchmark') or {}
         if bench.get('available'):
@@ -2516,10 +2797,12 @@ def load_recording(participant, state):
     stitch the files on their wall-clock time stamps and parse the sync log.
     Returns a dict (df_raw, sfreq, segments, files, paths) or None."""
     paths = resolve_participant_paths(participant, state)
-    found_files = sorted(glob.glob(os.path.join(paths['edf_dir'], paths['pattern'])))
+    found_files = find_edf_files(paths)  # [D25] one pattern or several
     if not found_files:
         print(f"❌ No files found matching '{paths['pattern']}' in {paths['edf_dir']}")
         return None
+    # [D27] other ECG leads that some trials of this participant are read from
+    extra_leads = sorted({c for c in paths['ecg_channel'].values() if c and c != ECG_CHANNEL})
 
     if USE_LONGEST_FILE_ONLY and len(found_files) > 1:
         durations = []
@@ -2539,10 +2822,11 @@ def load_recording(participant, state):
             continue
         if target_ch != ECG_CHANNEL:
             print(f"  ⚠ '{ECG_CHANNEL}' missing in {os.path.basename(f)}. Using '{target_ch}'.")
+        picks = [target_ch] + [c for c in extra_leads if c in r.ch_names and c != target_ch]
         try:
-            r.pick(picks=[target_ch])
+            r.pick(picks=picks)
         except AttributeError:
-            r.pick_channels([target_ch])
+            r.pick_channels(picks)
         if target_ch != ECG_CHANNEL:
             mne.rename_channels(r.info, {target_ch: ECG_CHANNEL})
 
@@ -2649,6 +2933,13 @@ def process_trial(seg, df_raw, sfreq, with_plots=False):
         print(f"  ⚠ {trial_name}: too few samples in window")
         return None
 
+    channel = seg.get('ecg_channel') or ECG_CHANNEL  # [D27]
+    if channel != ECG_CHANNEL and (channel not in segment_padded.columns
+                                   or segment_padded[channel].isna().any()):
+        print(f"  ⚠ {trial_name}: '{channel}' not recorded throughout this window; using {ECG_CHANNEL}")
+        channel = ECG_CHANNEL
+    if channel != ECG_CHANNEL or segment_padded.shape[1] > 1:
+        segment_padded = segment_padded[[channel]].rename(columns={channel: ECG_CHANNEL})
     sig_vals = (-segment_padded[ECG_CHANNEL].values if INVERT_ECG else segment_padded[ECG_CHANNEL].values)
     ecg_clean = nk.ecg_clean(sig_vals, sampling_rate=sfreq, method="elgendi2010")
     _, info = nk.ecg_peaks(ecg_clean, sampling_rate=sfreq, method="neurokit")
@@ -2672,13 +2963,20 @@ def process_trial(seg, df_raw, sfreq, with_plots=False):
     all_idx = final_idx.astype(int)
     ctx_timing, _ = detect_outlier_intervals(all_idx, sfreq)
     timing_window = ctx_timing[w0:w0 + nv - 1] if len(ctx_timing) >= w0 + nv - 1 else None
-    ctx_alt = _alternation_mask(np.diff(all_idx) / sfreq * 1000.0)  # [D21], same padded series
+    ctx_rr_all = np.diff(all_idx) / sfreq * 1000.0
+    ctx_alt = _alternation_mask(ctx_rr_all)  # [D21], same padded series
+    ctx_sus = _alternation_sustained(ctx_rr_all, ctx_alt)  # [D28] which stretches are sustained
     alt_window = ctx_alt[w0:w0 + nv - 1] if len(ctx_alt) >= w0 + nv - 1 else None
+    sus_window = ctx_sus[w0:w0 + nv - 1] if alt_window is not None else None
+    ctx_hole = recording_gap_intervals(segment_padded.index, all_idx)  # [D26] holes in the recording
+    hole_window = ctx_hole[w0:w0 + nv - 1] if len(ctx_hole) >= w0 + nv - 1 else None
 
     template_for, _template_beat = build_templates(ecg_clean, valid_peaks_idx, sfreq)
     ectopic_mask = detect_ectopic_beats(valid_peaks_idx, ecg_clean, sfreq, template_for)
     correction = perform_artifact_correction(valid_peaks_idx, sfreq, combined_bad_mask=ectopic_mask,
-                                             timing_bad=timing_window, alternating=alt_window)
+                                             timing_bad=timing_window, alternating=alt_window,
+                                             alternating_sustained=sus_window,
+                                             recording_gap=hole_window)
     hrv_results = calculate_hrv_metrics(valid_peaks_idx, sfreq, correction)  # same correction [D5]
     if hrv_results is None:
         return None
@@ -2696,6 +2994,9 @@ def process_trial(seg, df_raw, sfreq, with_plots=False):
         'corrected_type': correction['corrected_type'],
         'runs': correction['runs'], 'gpr_fit': correction['gpr_fit'], 'sfreq': sfreq,
         'beat_fate': correction['beat_fate'], 'breakdown': correction['breakdown'],
+        'ecg_channel': channel,  # [D27]
+        'unrecorded_s': unrecorded_seconds(segment_padded.index, t_start, t_stop, sfreq),  # [D26]
+        'recording_gaps': int(np.sum(hole_window)) if hole_window is not None else 0,  # [D26]
     }
     if with_plots:
         trial.update(_plot_payload(ecg_clean, segment_padded, pad_t1, t_start, t_stop, sfreq,
@@ -2743,6 +3044,11 @@ def process_participant_state(participant, state, with_plots=False):
     if skipped:
         print(f"  ℹ️  {len(skipped)} trial(s) named for the other medication state are in this recording's "
               f"time range and were skipped [D20]: {', '.join(skipped[:4])}{' …' if len(skipped) > 4 else ''}")
+    leads = {k: v for k, v in (rec['paths'].get('ecg_channel') or {}).items()
+             if v and any(sg['name'] == k for sg in segments)}
+    for seg in segments:  # [D27] per-trial ECG lead from the registry
+        if seg['name'] in leads:
+            seg['ecg_channel'] = leads[seg['name']]
     processed = {}
     for seg in segments:
         try:
@@ -2759,12 +3065,18 @@ def process_participant_state(participant, state, with_plots=False):
               f"{_b['dropped']} dropped ({_b['dropped_extra']} extra, {_b['dropped_excluded']} excluded) + "
               f"{_b['corrected']} corrected + {_b['kept']} kept | {_b['inserted']} inserted | "
               f"{int(np.sum(_e))} abnormal shape"
-              + (f" | alternating rhythm {_b['alternating_pct']:.0f} % [D21]" if _b['alternating_pct'] >= 1 else '')
+              + (f" | alternating rhythm {_b['alternating_pct']:.0f} % [D21]: {_b.get('corrected_alternating', 0)} beats "
+                 f"corrected, {_b['excluded_alternating']} excluded [D28]" if _b['alternating_pct'] >= 1 else '')
               + (f" | ⚠ {_b['unflagged_early_pct']:.0f} % unflagged early beats [D24]"
-                 if _b.get('unflagged_early_pct', 0) >= EARLY_CHECK_WARN_PCT else ''))
+                 if _b.get('unflagged_early_pct', 0) >= EARLY_CHECK_WARN_PCT else '')
+              + (f" | read from {trial['ecg_channel']} [D27]" if trial.get('ecg_channel') != ECG_CHANNEL else '')
+              + (f" | ⚠ {trial['unrecorded_s']:.0f} s of the window not recorded [D26]"
+                 if trial.get('unrecorded_s', 0) >= 2 else ''))
     print(f"\nℹ️  Processed {len(processed)}/{len(segments)} trials within the loaded recording(s).")
     run_info = {'Participant': participant, 'State': state.upper(), 'Sampling_Rate_Hz': rec['sfreq'],
-                'EDF_Files': '; '.join(rec['files']), 'Sync_Log': rec['paths']['sync']}
+                'EDF_Files': '; '.join(rec['files']), 'Sync_Log': rec['paths']['sync'],
+                'ECG_Channel_By_Trial': ('; '.join(f'{k}: {v}' for k, v in leads.items())
+                                         if leads else f'all trials: {ECG_CHANNEL}')}  # [D27]
     return processed, run_info
 
 
@@ -2778,11 +3090,11 @@ def preflight(runs):
     n_blocked = 0
     for p, s in runs:
         paths = resolve_participant_paths(p, s)
-        edfs = sorted(glob.glob(os.path.join(paths['edf_dir'], paths['pattern'])))
+        edfs = find_edf_files(paths)  # [D25]
         blocking, warn = [], []
         if not edfs:
             blocking.append('no EDF files match the glob')
-        n_ecg_ok = 0
+        n_ecg_ok, spans, leads_in = 0, [], []
         for f in edfs:
             try:
                 hdr = mne.io.read_raw_edf(f, preload=False, verbose=False)
@@ -2790,18 +3102,58 @@ def preflight(runs):
                     warn.append(f'no ECG channel in {os.path.basename(f)} (file will be skipped)')
                 else:
                     n_ecg_ok += 1
+                    leads_in.append(set(hdr.ch_names))
+                    if hdr.info['meas_date'] is not None:
+                        t0 = pd.to_datetime(hdr.info['meas_date']).replace(tzinfo=None)
+                        spans.append((t0, t0 + pd.Timedelta(seconds=hdr.n_times / hdr.info['sfreq'])))
             except Exception as e:
                 warn.append(f'unreadable {os.path.basename(f)}: {e}')
         if edfs and n_ecg_ok == 0:
             blocking.append('no readable EDF with an ECG channel')
         n_trials = 0
         if os.path.isfile(paths['sync']):
-            _all = parse_log_file_new(paths['sync'], pd.Timestamp('2000-01-01'))
-            n_trials = len(_segments_for_state(_all, s)[0])
+            base = min(a for a, _ in spans) if spans else pd.Timestamp('2000-01-01')
+            _all = parse_log_file_new(paths['sync'], base)
+            segs = _segments_for_state(_all, s)[0]
+            n_trials = len(segs)
             if not _all:
                 blocking.append('sync log has no start/stop trial pairs')
             elif n_trials == 0:
                 blocking.append(f'no {s} trials in the sync log (all are named for the other state) [D20]')
+            # per-trial checks against the EDF headers: is each window recorded? [D25, D26]
+            short, outside, partial = [], [], []
+            for sg in segs:
+                a, b = sg['start'], sg['stop']
+                dur = (b - a).total_seconds()
+                if dur < 5:
+                    short.append(sg['name'])
+                    continue
+                if not spans:
+                    continue
+                pts = sorted((max(x, a), min(y, b)) for x, y in spans if y > a and x < b)
+                merged = []
+                for x, y in pts:
+                    if merged and x <= merged[-1][1]:
+                        merged[-1][1] = max(merged[-1][1], y)
+                    else:
+                        merged.append([x, y])
+                cov = sum((y - x).total_seconds() for x, y in merged)
+                if cov < 1:
+                    outside.append(sg['name'])
+                elif cov < dur - 2:
+                    partial.append(f"{sg['name']} ({dur - cov:.0f} s)")
+
+            def _few(names):
+                return ', '.join(names[:4]) + (' …' if len(names) > 4 else '')
+            if short:
+                warn.append(f'{len(short)} trial(s) under 5 s in the sync log (placeholders, skipped): {_few(short)}')
+            if outside:
+                warn.append(f'{len(outside)} trial(s) outside these EDF files (skipped): {_few(outside)}')
+            if partial:
+                warn.append(f'{len(partial)} trial(s) partly unrecorded [D26]: {_few(partial)}')
+            for tr, ch in paths['ecg_channel'].items():  # [D27]
+                if any(sg['name'] == tr for sg in segs) and leads_in and not all(ch in c for c in leads_in):
+                    warn.append(f"'{ch}' (set for {tr}) is missing from some EDF files [D27]")
         else:
             blocking.append('sync log not found')
         out = output_path_for(p, s)
@@ -2925,7 +3277,8 @@ def _freq_row(label, power, peak):
 
 def build_stats_panel(t_raw, t_corr, f_clean, method_name, total_beats,
                       n_unique_bad, n_artifact_only, n_ectopic_only, n_both,
-                      benchmark=None, n_unrecoverable=0, breakdown=None):
+                      benchmark=None, n_unrecoverable=0, breakdown=None,
+                      unrecorded_s=0.0, ecg_channel=None):
     pct = n_unique_bad / total_beats * 100 if total_beats else 0
     excl = f_clean.get('excluded_beats', 0)
     excl_rate = f_clean.get('exclusion_rate', 0)
@@ -2970,7 +3323,10 @@ def build_stats_panel(t_raw, t_corr, f_clean, method_name, total_beats,
             style={'fontSize': '11px', 'color': '#666', 'marginBottom': '2px'})] if breakdown else []),
         *([html.Div(
             f"⚠ Alternating rhythm in {breakdown['alternating_pct']:.0f} % of intervals [D21]"
-            + (" — excluded" if ALTERNATION_HANDLING == 'exclude' else
+            + (f" — {breakdown.get('corrected_alternating', 0)} early beats corrected (short stretches), "
+               f"{breakdown['excluded_alternating']} beats excluded (sustained) [D28]"
+               if ALTERNATION_HANDLING == 'auto' else
+               " — excluded" if ALTERNATION_HANDLING == 'exclude' else
                " — kept as NN (ALTERNATION_HANDLING = 'keep')" if ALTERNATION_HANDLING == 'keep' else ''),
             style={'fontSize': '11px', 'color': '#922b21', 'fontWeight': 'bold', 'marginBottom': '2px'})]
           if breakdown and breakdown.get('alternating_pct', 0) >= 1 else []),
@@ -2979,6 +3335,16 @@ def build_stats_panel(t_raw, t_corr, f_clean, method_name, total_beats,
             f"normal neighbours) that is not flagged — possible frequent late premature beats [D24]",
             style={'fontSize': '11px', 'color': '#922b21', 'fontWeight': 'bold', 'marginBottom': '2px'})]
           if breakdown and breakdown.get('unflagged_early_pct', 0) >= EARLY_CHECK_WARN_PCT else []),
+        *([html.Div(
+            f"⚠ {unrecorded_s:.0f} s of this window were not recorded (gap between EDF files or past the "
+            f"recording's start/end)"
+            + ("; the interval across a gap is excluded [D26]" if RECORDING_GAP_HANDLING == 'exclude'
+               else " — not acted on (RECORDING_GAP_HANDLING = 'off') [D26]"),
+            style={'fontSize': '11px', 'color': '#922b21', 'fontWeight': 'bold', 'marginBottom': '2px'})]
+          if unrecorded_s and unrecorded_s >= 2 else []),
+        *([html.Div(f"Read from {ecg_channel} (registry setting for this trial) [D27]",
+                    style={'fontSize': '11px', 'color': '#1a5276', 'marginBottom': '2px'})]
+          if ecg_channel and ecg_channel != ECG_CHANNEL else []),
         html.Div(style={'marginBottom': '8px'}),
         html.Hr(style={'margin': '6px 0', 'borderColor': '#dee2e6'}),
 
@@ -3212,6 +3578,7 @@ def update_main_dashboard(trial_name, psd_method):
         benchmark=metrics.get('benchmark'),
         n_unrecoverable=metrics.get('n_unrecoverable_gaps', 0),
         breakdown=data.get('breakdown'),
+        unrecorded_s=data.get('unrecorded_s', 0.0), ecg_channel=data.get('ecg_channel'),
     )
 
     # uirevision=trial_name → Plotly resets view on trial change but preserves
@@ -3228,7 +3595,8 @@ def update_main_dashboard(trial_name, psd_method):
     corrected_beats = corrected_beats[:len(data['peak_times'])]
     # [D23] split the beats the correction touched: moved/removed vs left out of
     # the analysis altogether (inside an excluded stretch), with the reason
-    fate = np.asarray(data.get('beat_fate', []))[:len(data['peak_times'])]
+    _bf = data.get('beat_fate')
+    fate = np.asarray(_bf if _bf is not None else [])[:len(data['peak_times'])]
     if len(fate) != len(data['peak_times']):
         fate = np.where(corrected_beats, 'moved', 'clean')
     moved_b, excl_b = fate == 'moved', fate == 'excluded'
